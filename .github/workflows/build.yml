@@ -1,0 +1,286 @@
+name: VIDHWAAN PUZZLE DEPLOY
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      PROJECT_NAME: vidhwaan-puzzle
+
+    steps:
+      # =====================================
+      # CHECKOUT
+      # =====================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # =====================================
+      # NODE
+      # =====================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # =====================================
+      # INSTALL BUILD TOOLS
+      # =====================================
+      - name: Install Build Tools
+        run: |
+          npm install -g terser
+          npm install -g javascript-obfuscator
+          npm install -g clean-css-cli
+          npm install -g html-minifier-terser
+          npm install -g wrangler
+
+      # =====================================
+      # VERIFY ROOT FILES AND ICONS
+      # =====================================
+      - name: Verify Source Files
+        run: |
+          set -e
+
+          for file in \
+            index.html \
+            main.css \
+            app.js \
+            sw.js \
+            manifest.json \
+            icons/icon-192.png \
+            icons/icon-512.png \
+            icons/favicon.ico \
+            icons/logo.png
+          do
+            if [ ! -s "$file" ]; then
+              echo "ERROR: Required file missing or empty: $file"
+              exit 1
+            fi
+          done
+
+          node --check app.js
+          node --check sw.js
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8')); console.log('Manifest JSON valid')"
+
+      # =====================================
+      # CREATE DIST FROM ROOT
+      # NO PUBLIC FOLDER
+      # =====================================
+      - name: Prepare Dist Folder
+        run: |
+          set -e
+          rm -rf dist
+          mkdir -p dist/icons
+
+          cp index.html main.css app.js sw.js manifest.json dist/
+          cp -r icons/. dist/icons/
+
+      # =====================================
+      # MINIFY HTML
+      # =====================================
+      - name: Minify HTML
+        run: |
+          set -e
+
+          find dist -type f -name "*.html" -print0 |
+          while IFS= read -r -d '' file; do
+            html-minifier-terser \
+              --collapse-whitespace \
+              --remove-comments \
+              --remove-redundant-attributes \
+              --remove-script-type-attributes \
+              --remove-tag-whitespace \
+              --use-short-doctype \
+              --minify-css true \
+              --minify-js true \
+              "$file" -o "$file"
+          done
+
+      # =====================================
+      # MINIFY CSS
+      # =====================================
+      - name: Minify CSS
+        run: |
+          set -e
+
+          find dist -type f -name "*.css" -print0 |
+          while IFS= read -r -d '' file; do
+            cleancss -O2 "$file" -o "$file"
+          done
+
+      # =====================================
+      # MINIFY JAVASCRIPT
+      # =====================================
+      - name: Minify JavaScript
+        run: |
+          set -e
+
+          terser dist/app.js \
+            --compress \
+            --mangle \
+            --comments false \
+            -o dist/app.js
+
+          node --check dist/app.js
+
+      # =====================================
+      # OBFUSCATE APP.JS
+      # =====================================
+      - name: Obfuscate JavaScript
+        run: |
+          set -e
+
+          javascript-obfuscator dist/app.js \
+            --output dist/app.js \
+            --compact true \
+            --control-flow-flattening true \
+            --control-flow-flattening-threshold 0.5 \
+            --dead-code-injection false \
+            --disable-console-output false \
+            --identifier-names-generator hexadecimal \
+            --rename-globals false \
+            --self-defending false \
+            --split-strings true \
+            --split-strings-chunk-length 5 \
+            --string-array true \
+            --string-array-encoding base64 \
+            --string-array-threshold 0.75
+
+          node --check dist/app.js
+
+      # =====================================
+      # BUILD VERSION
+      # =====================================
+      - name: Generate Build Version
+        run: |
+          echo "BUILD_VERSION=$(date +%s)" >> "$GITHUB_ENV"
+
+      # =====================================
+      # CACHE BUSTING
+      # =====================================
+      - name: Inject Cache Busting
+        run: |
+          set -e
+
+          find dist -type f -name "*.html" -print0 |
+          while IFS= read -r -d '' file; do
+            sed -i \
+              -e "s|main.css|main.css?v=${BUILD_VERSION}|g" \
+              -e "s|app.js|app.js?v=${BUILD_VERSION}|g" \
+              "$file"
+          done
+
+      # =====================================
+      # SECURITY AND CACHE HEADERS
+      # =====================================
+      - name: Create Security Headers
+        run: |
+          cat > dist/_headers <<'EOF'
+          /*
+            X-Frame-Options: SAMEORIGIN
+            X-Content-Type-Options: nosniff
+            Referrer-Policy: strict-origin-when-cross-origin
+            Permissions-Policy: camera=(), microphone=(), geolocation=()
+            Content-Security-Policy: default-src 'self' https: data: blob: 'unsafe-inline' 'unsafe-eval';
+
+          /sw.js
+            Cache-Control: no-cache, no-store, must-revalidate
+
+          /index.html
+            Cache-Control: no-cache, must-revalidate
+
+          /manifest.json
+            Cache-Control: no-cache, must-revalidate
+          EOF
+
+      # =====================================
+      # VERIFY BUILD OUTPUT
+      # =====================================
+      - name: Verify Build Output
+        run: |
+          set -e
+
+          for file in \
+            index.html \
+            main.css \
+            app.js \
+            sw.js \
+            manifest.json \
+            icons/icon-192.png \
+            icons/icon-512.png \
+            icons/favicon.ico \
+            icons/logo.png \
+            _headers
+          do
+            test -s "dist/$file" || {
+              echo "ERROR: Build output missing: dist/$file"
+              exit 1
+            }
+          done
+
+          node --check dist/app.js
+          node --check dist/sw.js
+          node -e "JSON.parse(require('fs').readFileSync('dist/manifest.json','utf8'))"
+
+          echo "Build verification passed."
+
+      # =====================================
+      # CLOUDFLARE CREDENTIALS
+      # =====================================
+      - name: Validate Cloudflare Secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+
+      # =====================================
+      # CREATE PROJECT IF MISSING
+      # =====================================
+      - name: Create Cloudflare Project If Missing
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+
+          if npx wrangler pages project list | grep -Fq "$PROJECT_NAME"; then
+            echo "Cloudflare Pages project already exists."
+          else
+            npx wrangler pages project create "$PROJECT_NAME" \
+              --production-branch main
+          fi
+
+      # =====================================
+      # DEPLOY TO CLOUDFLARE PAGES
+      # =====================================
+      - name: Deploy To Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+
+          npx wrangler pages deploy dist \
+            --project-name="$PROJECT_NAME" \
+            --branch=main \
+            --commit-dirty=true
+
+      # =====================================
+      # SUCCESS
+      # =====================================
+      - name: Deployment Success
+        run: |
+          echo "VIDHWAAN PUZZLE DEPLOYED TO CLOUDFLARE PAGES"
+          echo "Project: $PROJECT_NAME"
+          echo "JavaScript minification: enabled"
+          echo "JavaScript obfuscation: enabled"
+          echo "Source directory: repository root"
+          echo "Deployment directory: dist/"
